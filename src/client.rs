@@ -3303,8 +3303,12 @@ impl Client {
                     info!("Got 503 service unavailable, will auto-reconnect.");
                 }
                 _ => {
+                    // Mirror whatsmeow's default: log + dispatch event, but keep the
+                    // connection alive. The server wraps per-stanza notifications in
+                    // <stream:error> without a code attribute (e.g. <ack/> for malformed
+                    // routing). Proactively disconnecting on those causes reconnect storms
+                    // under load — whatsmeow lets the noise socket detect a real teardown.
                     error!("Unknown stream error: {}", DisplayableNodeRef(node));
-                    self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError {
                             code: code.to_string(),
@@ -3315,7 +3319,9 @@ impl Client {
             }
         }
 
-        // Single transport lock acquisition for all branches that need disconnect.
+        // Only tear down the connection for branches that explicitly opted in.
+        // 429/503/unknown match whatsmeow: log and let the socket layer notice
+        // if the server actually closes the stream.
         if should_disconnect {
             let transport_opt = self.transport.lock().await.clone();
             if let Some(transport) = transport_opt {
@@ -3325,10 +3331,9 @@ impl Client {
                     }))
                     .detach();
             }
+            info!("Notifying connection shutdown from stream error handler");
+            self.notify_connection_shutdown();
         }
-
-        info!("Notifying connection shutdown from stream error handler");
-        self.notify_connection_shutdown();
     }
 
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
@@ -3904,6 +3909,10 @@ fn encode_ack_bytes(
         let from_str = from_val.as_str();
         p_str.as_ref() != from_str.as_ref()
     });
+    // Server expects `recipient` echoed back so it can route the ack to the
+    // origin companion/device (hosted-companion, peer, LID-routed stanzas).
+    // Dropping it makes the server close the stream with `<stream:error><ack/>`.
+    let recipient_val = node.get_attr("recipient");
     let tag = node.tag.as_ref();
 
     let typ_val = if tag != "message" && !is_encrypt_identity_notification(node) {
@@ -3914,16 +3923,18 @@ fn encode_ack_bytes(
 
     let include_from = tag == "message" && own_device_pn.is_some();
 
-    // Count attrs: class + id + to + optional(from, participant, type)
+    // Count attrs: class + id + to + optional(from, participant, recipient, type)
     let attr_count = 3
         + usize::from(include_from)
         + usize::from(participant_val.is_some())
+        + usize::from(recipient_val.is_some())
         + usize::from(typ_val.is_some());
 
     struct AckNode<'a> {
         id: &'a wacore_binary::node::ValueRef<'a>,
         from: &'a wacore_binary::node::ValueRef<'a>,
         participant: Option<&'a wacore_binary::node::ValueRef<'a>>,
+        recipient: Option<&'a wacore_binary::node::ValueRef<'a>>,
         typ: Option<&'a wacore_binary::node::ValueRef<'a>>,
         own_pn: Option<&'a Jid>,
         tag_str: &'a str,
@@ -3958,6 +3969,10 @@ fn encode_ack_bytes(
                 enc.write_string("participant")?;
                 p.encode_value(enc)?;
             }
+            if let Some(r) = self.recipient {
+                enc.write_string("recipient")?;
+                r.encode_value(enc)?;
+            }
             if let Some(t) = self.typ {
                 enc.write_string("type")?;
                 t.encode_value(enc)?;
@@ -3976,6 +3991,7 @@ fn encode_ack_bytes(
         id: id_val,
         from: from_val,
         participant: participant_val,
+        recipient: recipient_val,
         typ: typ_val,
         own_pn: if include_from { own_device_pn } else { None },
         tag_str: tag,
@@ -3999,13 +4015,14 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
         .get_attr("participant")
         .filter(|p| p.as_str().as_ref() != from_ref.as_str().as_ref())
         .map(|v| v.to_node_value());
+    let recipient = node.get_attr("recipient").map(|v| v.to_node_value());
     let tag = node.tag.as_ref();
     let typ = if tag != "message" && !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
     } else {
         None
     };
-    let mut attrs = Attrs::with_capacity(6);
+    let mut attrs = Attrs::with_capacity(7);
     attrs.insert("class", NodeValue::from(tag));
     attrs.insert("id", id);
     attrs.insert("to", from);
@@ -4016,6 +4033,9 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     }
     if let Some(p) = participant {
         attrs.insert("participant", p);
+    }
+    if let Some(r) = recipient {
+        attrs.insert("recipient", r);
     }
     if let Some(t) = typ {
         attrs.insert("type", t);
@@ -5865,6 +5885,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_ack_node_for_message_with_recipient_preserves_recipient() {
+        // Peer / hosted-companion / LID-routed messages carry `recipient`.
+        // The server uses it to route the ack back to the origin device;
+        // without it the stream is torn down with <stream:error><ack/></stream:error>.
+        let incoming = NodeBuilder::new("message")
+            .attr("from", "166361967902821@lid")
+            .attr("id", "2A32F960553696093D99")
+            .attr("type", "text")
+            .attr("recipient", "146991363395800@lid")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("message ack should be buildable");
+
+        assert!(ack.attrs.get("class").is_some_and(|v| v == "message"));
+        assert!(
+            ack.attrs
+                .get("recipient")
+                .is_some_and(|v| v == "146991363395800@lid"),
+            "message ACK must echo the incoming `recipient` attribute"
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_for_receipt_with_recipient_preserves_recipient() {
+        // Receipt acks must also echo `recipient` when the incoming carries it.
+        let incoming = NodeBuilder::new("receipt")
+            .attr("from", "120363098765432100@g.us")
+            .attr("id", "RCPT-WITH-RECIPIENT")
+            .attr("type", "read")
+            .attr("recipient", "242395589390497@lid")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("receipt ack should be buildable");
+
+        assert!(ack.attrs.get("class").is_some_and(|v| v == "receipt"));
+        assert!(
+            ack.attrs
+                .get("recipient")
+                .is_some_and(|v| v == "242395589390497@lid"),
+            "receipt ACK must echo the incoming `recipient` attribute"
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_for_message_without_recipient_omits_recipient() {
+        // Regression guard: never synthesise a `recipient` field if the
+        // incoming stanza did not carry one — server would reject the ack.
+        let incoming = NodeBuilder::new("message")
+            .attr("from", "120363161500776365@g.us")
+            .attr("id", "A5791A5392EF60E3FB06")
+            .attr("type", "text")
+            .attr("participant", "181531758878822@lid")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("message ack should be buildable");
+
+        assert!(
+            !ack.attrs.contains_key("recipient"),
+            "ACK must NOT add `recipient` when the incoming stanza has none"
+        );
+    }
+
     /// Smoke test: server ping with xmlns but no id attribute is handled.
     #[tokio::test]
     async fn test_handle_iq_ping_without_id() {
@@ -5991,6 +6086,46 @@ mod tests {
         assert!(
             client.enable_auto_reconnect.load(Ordering::Relaxed),
             "503 should keep auto-reconnect enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_unknown_keeps_connection_alive() {
+        // Unknown stream:error (no `code` attribute) must mirror whatsmeow's
+        // default branch: log + dispatch event, but NOT mark this as an
+        // expected disconnect. Setting that flag silently swallows the next
+        // real disconnect and races the read loop into shutdown.
+        let client = create_offline_sync_test_client().await;
+        let node = NodeBuilder::new("stream:error").build();
+        client.handle_stream_error(&node.as_node_ref()).await;
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "unknown stream:error must not mark the disconnect as expected"
+        );
+        assert!(
+            client.enable_auto_reconnect.load(Ordering::Relaxed),
+            "unknown stream:error must keep auto-reconnect enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_ack_shaped_does_not_force_shutdown() {
+        // Server wraps per-stanza routing failures in `<stream:error><ack/>`
+        // with no `code` attribute. Treat as informational, not as a fatal
+        // stream teardown.
+        let client = create_offline_sync_test_client().await;
+        let ack_child = NodeBuilder::new("ack")
+            .attr("class", "message")
+            .attr("type", "text")
+            .attr("id", "2A32F960553696093D99")
+            .build();
+        let node = NodeBuilder::new("stream:error")
+            .children([ack_child])
+            .build();
+        client.handle_stream_error(&node.as_node_ref()).await;
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "ack-shaped stream:error must not mark the disconnect as expected"
         );
     }
 
