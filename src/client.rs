@@ -3222,10 +3222,11 @@ impl Client {
     }
 
     pub(crate) async fn handle_stream_error(&self, node: &wacore_binary::NodeRef<'_>) {
-        // is_logged_in is cleared together with the disconnect below, never
-        // here: 429, 503, and unknown/code-less errors leave the session
-        // alive, and clearing it while the socket is up would flip
-        // is_fully_ready() and make prekey uploads bail with "Connection lost".
+        // is_logged_in handling: opt-in branches (515/516/401/409/conflict) clear it
+        // in the disconnect block below; 429/503 clear it inline because the server
+        // explicitly rejected the session and outgoing sends should bail fast; the
+        // unknown/code-less catch-all keeps it true so is_fully_ready()-gated work
+        // (notably prekey uploads) survives ack-shaped routing errors.
         let mut attrs = node.attrs();
         let code_cow = attrs.optional_string("code");
         let code = code_cow.as_deref().unwrap_or("");
@@ -3304,21 +3305,29 @@ impl Client {
                     should_disconnect = true;
                 }
                 "429" => {
+                    // Server signalled rate-limit on this session: mark logged-out so
+                    // outgoing sends bail fast instead of being interpreted as abuse
+                    // while we wait for the (likely-imminent) reconnect.
                     warn!(
                         "Got 429 stream error (rate limited). Will auto-reconnect with extended backoff."
                     );
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.auto_reconnect_errors.fetch_add(5, Ordering::Relaxed);
                 }
                 "503" => {
+                    // Server is going down/restarting: mark logged-out so sends fail
+                    // fast against the soon-to-die socket. Auto-reconnect handles recovery.
                     info!("Got 503 service unavailable, will auto-reconnect.");
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                 }
                 _ => {
                     // Server wraps per-stanza routing failures in <stream:error> without a
                     // code (e.g. <ack/>): treat as informational so we don't trigger reconnect
                     // storms. is_logged_in stays true on purpose — whatsmeow clears it eagerly,
                     // but here is_fully_ready() gates prekey uploads and we want them to keep
-                    // working while the socket is still alive.
-                    error!("Unknown stream error: {}", DisplayableNodeRef(node));
+                    // working while the socket is still alive. Severity is warn!, not error!,
+                    // because the connection is intentionally preserved.
+                    warn!("Unknown stream error: {}", DisplayableNodeRef(node));
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError {
                             code: code.to_string(),
@@ -6128,12 +6137,21 @@ mod tests {
     #[tokio::test]
     async fn test_stream_error_429_keeps_reconnect_with_backoff() {
         let client = create_offline_sync_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
         let before = client.auto_reconnect_errors.load(Ordering::Relaxed);
         let node = NodeBuilder::new("stream:error").attr("code", "429").build();
         client.handle_stream_error(&node.as_node_ref()).await;
         assert!(
             client.enable_auto_reconnect.load(Ordering::Relaxed),
             "429 should keep auto-reconnect enabled"
+        );
+        assert!(
+            !client.is_logged_in.load(Ordering::Relaxed),
+            "429 must clear is_logged_in so sends bail before the server flags abuse"
+        );
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "429 must not mark the disconnect as expected (auto-reconnect path)"
         );
         let after = client.auto_reconnect_errors.load(Ordering::Relaxed);
         assert_eq!(
@@ -6146,11 +6164,20 @@ mod tests {
     #[tokio::test]
     async fn test_stream_error_503_keeps_reconnect() {
         let client = create_offline_sync_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
         let node = NodeBuilder::new("stream:error").attr("code", "503").build();
         client.handle_stream_error(&node.as_node_ref()).await;
         assert!(
             client.enable_auto_reconnect.load(Ordering::Relaxed),
             "503 should keep auto-reconnect enabled"
+        );
+        assert!(
+            !client.is_logged_in.load(Ordering::Relaxed),
+            "503 must clear is_logged_in so sends bail against the dying socket"
+        );
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "503 must not mark the disconnect as expected (auto-reconnect path)"
         );
     }
 
