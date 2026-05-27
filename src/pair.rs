@@ -263,6 +263,15 @@ async fn handle_pair_success<'a>(
                 )))
                 .await;
 
+            // A prior pairing's `server_has_prekeys=true` would make
+            // `upload_pre_keys_at_login` skip and leave the server bundle stale.
+            // Reset it so the next connect re-uploads, matching WA Web where a
+            // freshly registered device always uploads its prekeys.
+            client
+                .persistence_manager
+                .modify_device(|d| d.server_has_prekeys = false)
+                .await;
+
             // Add the own LID-PN mapping to the cache so that when sending DMs to self,
             // we can find the existing LID-based session instead of creating a new PN-based one.
             // This is critical for self-messaging to work correctly.
