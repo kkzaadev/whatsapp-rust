@@ -251,6 +251,10 @@ mod tests {
         ) -> StoreResult<Option<Vec<u8>>> {
             Ok(None)
         }
+
+        async fn delete_expired_msg_secrets(&self, _cutoff: i64) -> StoreResult<u32> {
+            Ok(0)
+        }
     }
 
     // Implement DeviceStore - Device persistence

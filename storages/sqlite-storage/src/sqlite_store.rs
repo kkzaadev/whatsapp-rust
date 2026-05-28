@@ -2581,6 +2581,22 @@ impl MsgSecretStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+
+    async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let device_id = self.device_id;
+        self.with_retry("delete_expired_msg_secrets", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    msg_secrets::table
+                        .filter(msg_secrets::created_at.lt(cutoff_timestamp))
+                        .filter(msg_secrets::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
+        })
+        .await
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -3251,6 +3267,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing ({chat},{sender},{msg_id})"));
             assert_eq!(got, vec![expected; 32]);
         }
+    }
+
+    #[tokio::test]
+    async fn delete_expired_msg_secrets_deletes_only_below_cutoff() {
+        let store = create_test_store().await;
+        store
+            .put_msg_secret("c", "s", "M", &[7u8; 32])
+            .await
+            .unwrap();
+        let now = wacore::time::now_secs();
+        // cutoff well before insert → nothing deleted
+        let removed = store
+            .delete_expired_msg_secrets(now - 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(
+            store.get_msg_secret("c", "s", "M").await.unwrap().is_some(),
+            "row newer than cutoff must survive"
+        );
+        // cutoff after insert → deleted
+        let removed = store
+            .delete_expired_msg_secrets(now + 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(store.get_msg_secret("c", "s", "M").await.unwrap().is_none());
     }
 
     /// Multi-account isolation: same DB, different device_id rows must not

@@ -388,6 +388,11 @@ pub trait MsgSecretStore: Send + Sync {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Delete rows whose `created_at` is older than `cutoff_timestamp`
+    /// (seconds since epoch). Returns the number of rows removed so the
+    /// keepalive cleanup can log/throttle.
+    async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32>;
 }
 
 /// Combined storage backend trait.

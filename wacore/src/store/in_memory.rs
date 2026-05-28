@@ -62,7 +62,10 @@ struct InMemoryState {
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
     // --- MsgSecret ---
-    msg_secrets: HashMap<(String, String, String), Vec<u8>>,
+    /// Value is `(secret_bytes, created_at_secs)` so the keepalive cleanup
+    /// can prune expired entries the same way `delete_expired_sent_messages`
+    /// does for the retry cache.
+    msg_secrets: HashMap<(String, String, String), (Vec<u8>, i64)>,
 
     // --- Device ---
     device: Option<Device>,
@@ -600,7 +603,7 @@ impl MsgSecretStore for InMemoryBackend {
     ) -> Result<()> {
         self.state.lock().await.msg_secrets.insert(
             (chat.to_string(), sender.to_string(), msg_id.to_string()),
-            secret.to_vec(),
+            (secret.to_vec(), crate::time::now_secs()),
         );
         Ok(())
     }
@@ -617,7 +620,16 @@ impl MsgSecretStore for InMemoryBackend {
             .await
             .msg_secrets
             .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .cloned())
+            .map(|(secret, _)| secret.clone()))
+    }
+
+    async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut state = self.state.lock().await;
+        let before = state.msg_secrets.len();
+        state
+            .msg_secrets
+            .retain(|_, (_, ts)| *ts >= cutoff_timestamp);
+        Ok((before - state.msg_secrets.len()) as u32)
     }
 }
 
@@ -745,6 +757,46 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             vec![4u8; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_msg_secrets_removes_only_old_rows() {
+        let backend = InMemoryBackend::new();
+        backend
+            .put_msg_secret("c", "s", "OLD", &[1u8; 32])
+            .await
+            .unwrap();
+        // Mutate timestamp directly to simulate an old row.
+        {
+            let mut state = backend.state.lock().await;
+            let entry = state
+                .msg_secrets
+                .get_mut(&("c".into(), "s".into(), "OLD".into()))
+                .unwrap();
+            entry.1 = crate::time::now_secs() - 86_400 * 30;
+        }
+        backend
+            .put_msg_secret("c", "s", "NEW", &[2u8; 32])
+            .await
+            .unwrap();
+
+        let cutoff = crate::time::now_secs() - 86_400 * 14;
+        let removed = backend.delete_expired_msg_secrets(cutoff).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            backend
+                .get_msg_secret("c", "s", "OLD")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_msg_secret("c", "s", "NEW")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

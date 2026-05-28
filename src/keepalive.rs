@@ -160,6 +160,25 @@ impl Client {
                                         log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
                                     }
                                 })).detach();
+                                // msg_secrets retention: 14 days covers bot
+                                // edits / late reactions / poll votes while
+                                // bounding growth on long-running deployments.
+                                const MSG_SECRETS_TTL_SECS: i64 = 14 * 86_400;
+                                let backend = self.persistence_manager.backend();
+                                let secret_cutoff =
+                                    wacore::time::now_secs() - MSG_SECRETS_TTL_SECS;
+                                self.runtime.spawn(Box::pin(async move {
+                                    if let Err(e) = backend
+                                        .delete_expired_msg_secrets(secret_cutoff)
+                                        .await
+                                    {
+                                        log::debug!(
+                                            target: "Client/Keepalive",
+                                            "msg_secrets cleanup error: {e}"
+                                        );
+                                    }
+                                }))
+                                .detach();
                             }
                         }
                         KeepaliveResult::FatalFailure => {
