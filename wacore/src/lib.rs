@@ -8,6 +8,7 @@ pub use wacore_derive::{EmptyNode, ProtocolNode, WireEnum};
 
 pub mod adv;
 pub mod appstate_sync;
+pub mod bot_message;
 pub mod client;
 pub mod client_profile;
 pub mod companion_reg;
