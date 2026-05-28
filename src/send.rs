@@ -1479,7 +1479,7 @@ impl Client {
         chat: &Jid,
         sender: &Jid,
         msg_id: &str,
-        secret: &[u8],
+        secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
     ) {
         let chat_str = chat.to_non_ad().to_string();
         let sender_str = sender.to_non_ad().to_string();

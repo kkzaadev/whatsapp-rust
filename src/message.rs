@@ -263,7 +263,8 @@ impl Client {
                 .and_then(|bi| bi.edit_target_id.as_deref())
         } else {
             Some(info_id)
-        };
+        }
+        .filter(|fb| *fb != primary_msg_id);
 
         let attempt = |msg_id: &str| {
             let ctx = BotMessageContext {
