@@ -231,10 +231,19 @@ impl Client {
         };
 
         let bot_user_jid = info.source.sender.to_non_ad().to_string();
-        // Bot edit chain: when `<bot edit="inner|last">`, swap in
-        // `edit_target_id` as the HKDF msg_id so this reply decrypts under
-        // the same key as the message it edits.
-        let hkdf_msg_id = info
+        // WA Web `decryptMsmsgBotMessage` dispatches on `isFbidBot()`:
+        //   * fbid path pre-resolves to `edit_target_id` for INNER/LAST edits,
+        //     `externalId` (info.id) otherwise. Single AES-GCM attempt.
+        //   * regular path tries `externalId` first, falls back to
+        //     `edit_target_id` on AES-GCM failure.
+        // We don't have `isFbidBot()` detection; instead, we unify the two as
+        // try-then-fallback with the fbid-style id as primary. That's a strict
+        // superset: for INNER/LAST it usually succeeds on the first try (fbid
+        // outcome); for any other case primary is `info.id` so we mirror the
+        // regular path's first attempt. The fallback is only attempted if
+        // `bot_info.edit_target_id` is present.
+        let info_id = info.id.as_str();
+        let primary_msg_id = info
             .bot_info
             .as_ref()
             .filter(|bi| {
@@ -247,20 +256,47 @@ impl Client {
                 )
             })
             .and_then(|bi| bi.edit_target_id.as_deref())
-            .unwrap_or(info.id.as_str());
-        let ctx = BotMessageContext {
-            msg_id: hkdf_msg_id,
-            target_sender_user_jid: &target_sender_str,
-            bot_user_jid: &bot_user_jid,
+            .unwrap_or(info_id);
+        let fallback_msg_id = if primary_msg_id == info_id {
+            info.bot_info
+                .as_ref()
+                .and_then(|bi| bi.edit_target_id.as_deref())
+        } else {
+            Some(info_id)
         };
 
-        let plaintext = match decrypt_bot_message(&secret, enc_iv, enc_payload, &ctx) {
+        let attempt = |msg_id: &str| {
+            let ctx = BotMessageContext {
+                msg_id,
+                target_sender_user_jid: &target_sender_str,
+                bot_user_jid: &bot_user_jid,
+            };
+            decrypt_bot_message(&secret, enc_iv, enc_payload, &ctx)
+        };
+
+        let plaintext = match attempt(primary_msg_id) {
             Ok(p) => p,
-            Err(e) => {
-                log::warn!("[msg:{}] msmsg AES-GCM open failed: {e:?}", info.id);
-                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                return;
-            }
+            Err(primary_err) => match fallback_msg_id {
+                Some(fb) => match attempt(fb) {
+                    Ok(p) => p,
+                    Err(fallback_err) => {
+                        log::warn!(
+                            "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
+                            info.id
+                        );
+                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        return;
+                    }
+                },
+                None => {
+                    log::warn!(
+                        "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
         };
 
         let msg = match wa::Message::decode(plaintext.as_slice()) {
@@ -8210,6 +8246,155 @@ mod tests {
         )
         .await;
         assert!(got.is_some(), "edit=first must keep info.id as HKDF msg_id");
+    }
+
+    /// Regular bot path (`f()` in WA Web `BotMessageSecret.js`): when the
+    /// fbid pre-resolve picks the WRONG id (e.g. edit_target_id) but the
+    /// real ciphertext was minted under `info.id`, the fallback attempt
+    /// must succeed. Validates the try-then-fallback unification.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_info").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_FB1";
+        let stanza_id = "REPLY_FB1";
+        let edit_target_id = "WRONG_EDIT_TARGET";
+        let secret = [0xDDu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under `stanza_id` even though the stanza will declare
+        // edit=inner with edit_target_id (forces a primary-attempt mismatch).
+        let plaintext_msg = wa::Message {
+            conversation: Some("fallback ok".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("fallback ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with edit_target_id must fall back to info.id"
+        );
+    }
+
+    /// Mirror scenario: no `<bot edit>`, so the parser doesn't populate
+    /// `edit_target_id`. Primary uses `info.id`; with no fallback id
+    /// available, a deliberately-wrong-key payload must nack 495 (no second
+    /// attempt to silently mask the failure).
+    #[tokio::test]
+    async fn msmsg_no_fallback_when_no_edit_target_present() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_nofb").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_NOFB";
+        let stanza_id = "REPLY_NOFB";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under a DIFFERENT id; no <bot> node so parser leaves
+        // edit_target_id = None and there's nothing to fall back to.
+        let ctx = BotMessageContext {
+            msg_id: "MISMATCHED_ID",
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "no fallback id available → single AES-GCM failure must nack 495"
+        );
     }
 
     /// Coherence: the identity `persist_outbound_msg_secret` writes under
