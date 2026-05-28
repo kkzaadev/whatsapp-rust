@@ -360,10 +360,45 @@ pub trait DeviceStore: Send + Sync {
     }
 }
 
+/// Per-outbound-message secret storage for addon-style decryption.
+///
+/// Persists the 32-byte `MessageContextInfo.messageSecret` we send out so that
+/// later inbound replies (poll votes, reactions, msmsg bot responses, edits)
+/// referencing the original message ID can be decrypted. Mirrors WA Web's
+/// `WAWebMsmsgMsgSecretCache` + the `messageSecret` field on the DB message row.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait MsgSecretStore: Send + Sync {
+    /// Persist `secret` (typically 32 bytes) under the composite key.
+    /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
+    /// callers should pass non-AD (no-device) form for the JIDs so lookups
+    /// match regardless of which device echo'd the stanza back.
+    async fn put_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+        secret: &[u8],
+    ) -> Result<()>;
+
+    /// Fetch the persisted secret; returns `None` if absent.
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>>;
+}
+
 /// Combined storage backend trait.
 ///
-/// Any type implementing all four domain traits automatically implements `Backend`.
-pub trait Backend: SignalStore + AppSyncStore + ProtocolStore + DeviceStore + Send + Sync {}
+/// Any type implementing all domain traits automatically implements `Backend`.
+pub trait Backend:
+    SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
+{
+}
 
-impl<T> Backend for T where T: SignalStore + AppSyncStore + ProtocolStore + DeviceStore + Send + Sync
-{}
+impl<T> Backend for T where
+    T: SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
+{
+}

@@ -20,7 +20,7 @@ mod tests {
     use wacore::store::error::Result as StoreResult;
     use wacore::store::traits::{
         AppStateSyncKey, AppSyncStore, DeviceListRecord, DeviceStore, LidPnMappingEntry,
-        ProtocolStore, SignalStore,
+        MsgSecretStore, ProtocolStore, SignalStore,
     };
     use waproto::whatsapp as wa;
 
@@ -227,6 +227,29 @@ mod tests {
         }
         async fn delete_expired_sent_messages(&self, _: i64) -> StoreResult<u32> {
             Ok(0)
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl MsgSecretStore for MockBackend {
+        async fn put_msg_secret(
+            &self,
+            _chat: &str,
+            _sender: &str,
+            _msg_id: &str,
+            _secret: &[u8],
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn get_msg_secret(
+            &self,
+            _chat: &str,
+            _sender: &str,
+            _msg_id: &str,
+        ) -> StoreResult<Option<Vec<u8>>> {
+            Ok(None)
         }
     }
 

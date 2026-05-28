@@ -61,6 +61,9 @@ struct InMemoryState {
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
+    // --- MsgSecret ---
+    msg_secrets: HashMap<(String, String, String), Vec<u8>>,
+
     // --- Device ---
     device: Option<Device>,
 }
@@ -582,6 +585,43 @@ impl ProtocolStore for InMemoryBackend {
 }
 
 // ---------------------------------------------------------------------------
+// MsgSecretStore
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl MsgSecretStore for InMemoryBackend {
+    async fn put_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+        secret: &[u8],
+    ) -> Result<()> {
+        self.state.lock().await.msg_secrets.insert(
+            (chat.to_string(), sender.to_string(), msg_id.to_string()),
+            secret.to_vec(),
+        );
+        Ok(())
+    }
+
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .msg_secrets
+            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
+            .cloned())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeviceStore
 // ---------------------------------------------------------------------------
 
@@ -621,5 +661,112 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn msg_secret_round_trip() {
+        let backend = InMemoryBackend::new();
+        let secret = [7u8; 32];
+        backend
+            .put_msg_secret("12345@s.whatsapp.net", "9999@lid", "MID1", &secret)
+            .await
+            .unwrap();
+        let got = backend
+            .get_msg_secret("12345@s.whatsapp.net", "9999@lid", "MID1")
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&secret[..]));
+    }
+
+    #[tokio::test]
+    async fn msg_secret_miss_returns_none() {
+        let backend = InMemoryBackend::new();
+        assert!(
+            backend
+                .get_msg_secret("12345@s.whatsapp.net", "9999@lid", "MID1")
+                .await
+                .unwrap()
+                .is_none(),
+            "absent secret must return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_secret_keyed_by_all_three_columns() {
+        // Same chat+sender, different msg_id → independent entries.
+        // Same chat+msg_id, different sender → independent entries.
+        // Same sender+msg_id, different chat → independent entries.
+        let backend = InMemoryBackend::new();
+        backend
+            .put_msg_secret("chatA", "senderX", "M1", &[1u8; 32])
+            .await
+            .unwrap();
+        backend
+            .put_msg_secret("chatA", "senderX", "M2", &[2u8; 32])
+            .await
+            .unwrap();
+        backend
+            .put_msg_secret("chatA", "senderY", "M1", &[3u8; 32])
+            .await
+            .unwrap();
+        backend
+            .put_msg_secret("chatB", "senderX", "M1", &[4u8; 32])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .get_msg_secret("chatA", "senderX", "M1")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![1u8; 32]
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret("chatA", "senderX", "M2")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![2u8; 32]
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret("chatA", "senderY", "M1")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![3u8; 32]
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret("chatB", "senderX", "M1")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![4u8; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_secret_overwrite_on_same_key() {
+        let backend = InMemoryBackend::new();
+        backend
+            .put_msg_secret("chat", "sender", "M", &[1u8; 32])
+            .await
+            .unwrap();
+        backend
+            .put_msg_secret("chat", "sender", "M", &[9u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_msg_secret("chat", "sender", "M")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![9u8; 32],
+            "last write wins for the same composite key"
+        );
     }
 }
