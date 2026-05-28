@@ -64,6 +64,28 @@ macro_rules! for_each_context_info_impl {
     };
 }
 
+/// Returns `Some(ctx)` for the first message variant carrying a `ContextInfo`,
+/// short-circuiting on match (`break 'find`). Read-only variant of
+/// [`for_each_context_info_message!`].
+macro_rules! find_context_info_ref {
+    ($msg:expr) => {{ with_context_info_fields!(find_context_info_impl!($msg,)) }};
+}
+
+macro_rules! find_context_info_impl {
+    ($msg:expr, $($field:ident),+ $(,)?) => {{
+        let mut found: Option<&wa::ContextInfo> = None;
+        $(
+            if found.is_none()
+                && let Some(ref m) = $msg.$field
+                && let Some(ref ctx) = m.context_info
+            {
+                found = Some(ctx);
+            }
+        )+
+        found
+    }};
+}
+
 /// Extension trait for wa::Message
 pub trait MessageExt {
     /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.
@@ -136,6 +158,18 @@ pub trait MessageExt {
     /// (mirrors `WAWebMessageSendUtils`). Returns `true` on success or
     /// promotion, `false` only when no body can carry the timer.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
+
+    /// `context_info.is_forwarded == Some(true)` on the first base message
+    /// that carries a context_info. Mirrors WA Web's `x.isForwarded`
+    /// guard in `processRenderableMessages` (which skips caching
+    /// `messageSecret` for forwarded payloads).
+    fn is_forwarded(&self) -> bool;
+
+    /// `true` if `context_info.mentioned_jid` on any base message contains
+    /// a JID whose user-form ends with `@bot`. Mirrors WA Web's
+    /// `mentionedJidList.find(jid.isBot())` lookup used to derive
+    /// `invokedBotWid` when `messageSecret` is present.
+    fn mentions_any_bot(&self) -> bool;
 }
 
 impl MessageExt for wa::Message {
@@ -371,6 +405,23 @@ impl MessageExt for wa::Message {
         }
 
         false
+    }
+
+    fn is_forwarded(&self) -> bool {
+        let base = self.get_base_message();
+        find_context_info_ref!(base)
+            .and_then(|ctx| ctx.is_forwarded)
+            .unwrap_or(false)
+    }
+
+    fn mentions_any_bot(&self) -> bool {
+        let base = self.get_base_message();
+        let Some(ctx) = find_context_info_ref!(base) else {
+            return false;
+        };
+        ctx.mentioned_jid
+            .iter()
+            .any(|s| s.split('@').nth(1) == Some("bot"))
     }
 }
 

@@ -142,6 +142,7 @@ impl Client {
         msg: &wa::Message,
         info: &Arc<MessageInfo>,
     ) {
+        use wacore::proto_helpers::MessageExt;
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
         let Some(secret_bytes) = msg
             .message_context_info
@@ -153,7 +154,15 @@ impl Client {
         let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
             return;
         };
-        if info.source.chat.server != wacore_binary::Server::Bot {
+        // Match WA Web `processRenderableMessages`: `$ && (P || N) && !forwarded`.
+        // `P` = chat is bot; `N` = a mentioned JID is a bot (covers groups
+        // where the user invokes @Meta AI). The `w`/`A` group-bot-participant
+        // gates are flagged behind WA Web feature flags and skipped here.
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        if !chat_is_bot && !msg.mentions_any_bot() {
+            return;
+        }
+        if msg.is_forwarded() {
             return;
         }
         // Stack-copy the 32-byte array into the spawned future; Arc<MessageInfo>
@@ -8617,6 +8626,122 @@ mod tests {
             got.is_none(),
             "non-bot chats must not persist embedded msg_secrets"
         );
+    }
+
+    /// Group invocation: user mentions @MetaAI in a group → chat is the
+    /// GROUP (not bot), but mentioned_jid contains the bot. WA Web's
+    /// `processRenderableMessages` keys off `N` (invokedBotWid derived from
+    /// `mentionedJidList.find(isBot)`); we must persist too.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() {
+        use crate::store::commands::DeviceCommand;
+        let (client, _transport) = capturing_client("capture_group_mention").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+
+        let info = Arc::new(MessageInfo {
+            id: "GRP_MENTION".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hey @MetaAI tell me a joke".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xEE; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info);
+
+        let mut got = None;
+        for _ in 0..40 {
+            got = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(
+                    "120363021033254949@g.us",
+                    "5511000000001@s.whatsapp.net",
+                    "GRP_MENTION",
+                )
+                .await
+                .unwrap();
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0xEEu8; 32][..]),
+            "group invocation via @bot mention must still cache the secret"
+        );
+    }
+
+    /// Forwarded message with a secret must NOT be cached — matches WA Web's
+    /// `x.isForwarded !== true` guard. A planted forward shouldn't poison
+    /// the cache.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
+        let (client, _transport) = capturing_client("capture_skip_forwarded").await;
+        let info = Arc::new(MessageInfo {
+            id: "FWD_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("forwarded".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xFF; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info);
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "867051314767696@bot",
+                "5511000000001@s.whatsapp.net",
+                "FWD_1",
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none(), "forwarded messages must not seed the cache");
     }
 
     #[tokio::test]
