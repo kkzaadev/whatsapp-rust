@@ -1960,4 +1960,109 @@ mod tests {
         };
         assert!(msg.is_view_once());
     }
+
+    #[test]
+    fn mentions_any_bot_true_for_bot_jid_in_extended_text() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "867051314767696@bot".into(),
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_without_bot_jid() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi friends".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "120363021033254949@g.us".into(),
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_for_no_context_info() {
+        let msg = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_sees_through_device_sent_wrapper() {
+        let msg = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                destination_jid: Some("867051314767696@bot".into()),
+                message: Some(Box::new(wa::Message {
+                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                        text: Some("@MetaAI".into()),
+                        context_info: Some(Box::new(wa::ContextInfo {
+                            mentioned_jid: vec!["867051314767696@bot".into()],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(
+            msg.mentions_any_bot(),
+            "must unwrap DeviceSentMessage before reading context_info"
+        );
+    }
+
+    #[test]
+    fn is_forwarded_true_and_false() {
+        let fwd = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("fwd".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(fwd.is_forwarded());
+
+        let plain = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!plain.is_forwarded());
+
+        let not_fwd = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo::default())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!not_fwd.is_forwarded());
+    }
 }

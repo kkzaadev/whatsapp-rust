@@ -254,21 +254,39 @@ impl Client {
             }
         };
 
-        let secret = match self
-            .persistence_manager
-            .backend()
+        // Mirror WA Web `C()` in `WAWebBotMessageSecret.js`: primary lookup
+        // plus an alternate (PN ↔ LID swap via lid_pn_mapping) so a row
+        // stored under one identity family is still found if `<meta
+        // target_sender_jid>` echoes the other. Covers LID migration windows
+        // and asymmetric outbound/inbound identities.
+        let backend = self.persistence_manager.backend();
+        let primary = backend
             .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
-            .await
-        {
+            .await;
+        let secret = match primary {
             Ok(Some(s)) => s,
-            Ok(None) => {
-                log::warn!(
-                    "[msg:{}] msmsg: no message_secret stored for target_id={target_id}",
-                    info.id
-                );
-                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                return;
-            }
+            Ok(None) => match self
+                .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
+                .await
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    log::warn!(
+                        "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] msmsg: alternate lookup failed: {e:?}; nack 495",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
             Err(e) => {
                 log::warn!(
                     "[msg:{}] backend error reading message_secret ({e:?}); nack 495 so the server stops replaying",
@@ -375,6 +393,41 @@ impl Client {
         } else {
             self.get_pn().await
         }
+    }
+
+    /// Second-chance lookup with the alternate identity family. Mirrors
+    /// `WAWebLidMigrationUtils.getAlternateMsgKey`: swap PN ↔ LID via the
+    /// `lid_pn_mapping` store and retry. Returns `Ok(None)` when no mapping
+    /// is known or the alternate row is absent — the caller treats that as
+    /// a terminal miss.
+    async fn alternate_msg_secret_lookup(
+        &self,
+        backend: &Arc<dyn crate::store::traits::Backend>,
+        chat_for_lookup: &str,
+        primary_sender: &Jid,
+        target_id: &str,
+    ) -> Result<Option<Vec<u8>>, crate::store::error::StoreError> {
+        let alternate_user = match primary_sender.server {
+            wacore_binary::Server::Lid => backend
+                .get_lid_mapping(&primary_sender.user)
+                .await?
+                .map(|m| (m.phone_number, wacore_binary::Server::Pn)),
+            wacore_binary::Server::Pn => backend
+                .get_pn_mapping(&primary_sender.user)
+                .await?
+                .map(|m| (m.lid, wacore_binary::Server::Lid)),
+            _ => None,
+        };
+        let Some((user, server)) = alternate_user else {
+            return Ok(None);
+        };
+        let mut alternate_str = String::with_capacity(user.len() + 1 + server.as_str().len());
+        alternate_str.push_str(&user);
+        alternate_str.push('@');
+        alternate_str.push_str(server.as_str());
+        backend
+            .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
+            .await
     }
 
     /// Handles a newsletter plaintext message.
@@ -8867,6 +8920,104 @@ mod tests {
         assert!(
             got.is_some(),
             "msmsg sibling of an unknown enc must still decrypt and dispatch"
+        );
+    }
+
+    /// LID↔PN migration window: the secret was stored under our PN, but the
+    /// bot reply's `<meta target_sender_jid>` echoes our LID. The primary
+    /// lookup misses; `alternate_msg_secret_lookup` resolves PN via
+    /// `lid_pn_mapping` and hits. Mirrors WA Web `C()`'s `getAlternateMsgKey`.
+    #[tokio::test]
+    async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("msmsg_alt_lookup").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_lid_user = "999888777666555";
+        let our_pn_user = "5511000000001";
+        let our_lid = "999888777666555@lid";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_ALT";
+        let bot_reply_id = "REPLY_ALT";
+        let secret = [0x3Cu8; 32];
+
+        // Seed the LID→PN mapping so the alternate lookup can swap.
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: our_lid_user.into(),
+                phone_number: our_pn_user.into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Secret stored under PN (as if the outbound went out PN-addressed).
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Bot reply encrypts with target = our LID (what <meta> declares).
+        let plaintext_msg = wa::Message {
+            conversation: Some("alt ok".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("alt ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "LID-declared reply must resolve the PN-stored secret via lid_pn_mapping"
         );
     }
 
