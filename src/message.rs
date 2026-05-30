@@ -298,7 +298,11 @@ impl Client {
         let target_id = env.target_id()?;
 
         let my_jid = self.own_jid_for_secret_encrypted(info).await?;
-        let original_sender = match env.original_sender_jid(&my_jid) {
+        let original_sender = match env.original_sender_for_dispatch(
+            info.source.is_from_me,
+            &info.source.sender,
+            &my_jid,
+        ) {
             Ok(jid) => jid,
             Err(_) => return None,
         };

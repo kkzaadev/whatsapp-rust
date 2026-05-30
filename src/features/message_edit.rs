@@ -247,6 +247,32 @@ impl<'a> SecretEncrypted<'a> {
     pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
         resolve_target_sender(self.target_message_key, my_jid)
     }
+
+    /// Resolve the parent message's author for the secret lookup + HKDF info,
+    /// using the dispatch-time envelope frame.
+    ///
+    /// For `MESSAGE_EDIT` the editor is always the author (you can only edit
+    /// your own message) and `target_message_key` is written in the editor's
+    /// frame — its `from_me` is `true` even for an incoming peer edit, so it is
+    /// not a reliable receiver-side signal. Take the author from the envelope
+    /// instead: ourselves for a self-synced edit, else the envelope sender.
+    /// Other kinds (poll/event) can be modified by a non-author, so for those
+    /// `target_message_key` stays authoritative.
+    pub fn original_sender_for_dispatch(
+        &self,
+        is_from_me: bool,
+        envelope_sender: &Jid,
+        my_jid: &Jid,
+    ) -> Result<Jid> {
+        match self.kind {
+            SecretEncKind::MessageEdit => Ok(if is_from_me {
+                my_jid.to_non_ad()
+            } else {
+                envelope_sender.to_non_ad()
+            }),
+            _ => resolve_target_sender(self.target_message_key, my_jid),
+        }
+    }
 }
 
 /// Extract any supported `secret_encrypted_message` envelope (EVENT_EDIT,
@@ -485,6 +511,110 @@ mod tests {
         assert_eq!(
             env.original_sender_jid(&my_jid).unwrap().to_string(),
             "5510000@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn message_edit_original_sender_uses_envelope_sender_for_incoming_peer_edit() {
+        // Captured wire data: when a peer edits THEIR OWN message, the target
+        // key is written in the EDITOR's frame — from_me=true, no participant,
+        // even in groups. Trusting target_key.from_me resolves the original
+        // sender to *us*, so the parent messageSecret lookup misses. The editor
+        // is always the author (you can only edit your own message), so the
+        // sender must come from the envelope frame.
+        let msg = wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(wa::MessageKey {
+                    remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "100000000000001@lid".parse::<Jid>().unwrap();
+        let editor = "200000000000002@lid".parse::<Jid>().unwrap();
+        // Incoming peer edit: envelope is NOT from me → sender is the editor.
+        assert_eq!(
+            env.original_sender_for_dispatch(false, &editor, &my_jid)
+                .unwrap()
+                .to_string(),
+            "200000000000002@lid"
+        );
+    }
+
+    #[test]
+    fn message_edit_original_sender_uses_my_jid_for_self_synced_edit() {
+        // Our own edit, synced from another linked device: the envelope IS from
+        // me, so the original sender is us — device suffix stripped.
+        let msg = wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(wa::MessageKey {
+                    remote_jid: Some("200000000000002@lid".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "100000000000001:3@lid".parse::<Jid>().unwrap();
+        let editor = "100000000000001@lid".parse::<Jid>().unwrap();
+        assert_eq!(
+            env.original_sender_for_dispatch(true, &editor, &my_jid)
+                .unwrap()
+                .to_string(),
+            "100000000000001@lid"
+        );
+    }
+
+    #[test]
+    fn poll_edit_original_sender_still_uses_target_key() {
+        // Regression guard: poll/event modifications can be authored by someone
+        // other than the target's author (e.g. a peer votes on our poll), so the
+        // target key stays authoritative for non-edit kinds.
+        let msg = wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("creator@s.whatsapp.net".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::PollEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let voter = "voter@s.whatsapp.net".parse::<Jid>().unwrap();
+        // Envelope sender (voter) differs, but the target's participant (poll
+        // creator) wins for poll kinds.
+        assert_eq!(
+            env.original_sender_for_dispatch(false, &voter, &my_jid)
+                .unwrap()
+                .to_string(),
+            "creator@s.whatsapp.net"
         );
     }
 
