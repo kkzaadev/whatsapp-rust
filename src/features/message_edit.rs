@@ -249,6 +249,33 @@ impl<'a> SecretEncrypted<'a> {
     }
 }
 
+    /// Resolve the parent message's author for the secret lookup + HKDF info,
+    /// using the dispatch-time envelope frame.
+    ///
+    /// For `MESSAGE_EDIT` the editor is always the author (you can only edit
+    /// your own message) and `target_message_key` is written in the editor's
+    /// frame — its `from_me` is `true` even for an incoming peer edit, so it is
+    /// not a reliable receiver-side signal. Take the author from the envelope
+    /// instead: ourselves for a self-synced edit, else the envelope sender.
+    /// Other kinds (poll/event) can be modified by a non-author, so for those
+    /// `target_message_key` stays authoritative.
+    pub fn original_sender_for_dispatch(
+        &self,
+        is_from_me: bool,
+        envelope_sender: &Jid,
+        my_jid: &Jid,
+    ) -> Result<Jid> {
+        match self.kind {
+            SecretEncKind::MessageEdit => Ok(if is_from_me {
+                my_jid.to_non_ad()
+            } else {
+                envelope_sender.to_non_ad()
+            }),
+            _ => resolve_target_sender(self.target_message_key, my_jid),
+        }
+    }
+}
+
 /// Extract any supported `secret_encrypted_message` envelope (EVENT_EDIT,
 /// MESSAGE_EDIT, POLL_EDIT, POLL_ADD_OPTION) from a received message.
 ///
